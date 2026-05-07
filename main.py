@@ -1,6 +1,7 @@
 """
 🏋️ Fitness Coach Agent
 Telegram bot che usa Claude per analizzare i tuoi dati fitness da Supabase
+Con tracciamento interno dei token e costi
 """
 
 import os
@@ -12,14 +13,17 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
 # ─────────────────────────────────────────────
-# Configurazione — tutte le variabili vengono
-# lette dalle environment variables di Railway
+# Configurazione
 # ─────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 SUPABASE_URL     = os.environ["SUPABASE_URL"]
 SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
 ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
-ALLOWED_USER_ID  = int(os.environ.get("ALLOWED_USER_ID", "0"))  # sicurezza: solo tu puoi usarlo
+ALLOWED_USER_ID  = int(os.environ.get("ALLOWED_USER_ID", "0"))
+
+# Prezzi claude-sonnet-4-5 per milione di token (USD)
+PRICE_INPUT_PER_M  = 3.00
+PRICE_OUTPUT_PER_M = 15.00
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
@@ -55,11 +59,10 @@ Rispondi sempre in italiano."""
 
 
 # ─────────────────────────────────────────────
-# Funzioni per leggere i dati da Supabase
+# Funzioni Supabase — dati fitness
 # ─────────────────────────────────────────────
 
 def get_recent_metrics(days: int = 14) -> list:
-    """Legge le metriche giornaliere degli ultimi N giorni."""
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     result = supabase.table("daily_health_metrics") \
         .select("*") \
@@ -70,7 +73,6 @@ def get_recent_metrics(days: int = 14) -> list:
 
 
 def get_recent_workouts(days: int = 30) -> list:
-    """Legge le sessioni di allenamento degli ultimi N giorni."""
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     result = supabase.table("workouts") \
         .select("*") \
@@ -81,7 +83,6 @@ def get_recent_workouts(days: int = 30) -> list:
 
 
 def get_weight_trend(days: int = 90) -> list:
-    """Legge il trend peso degli ultimi N giorni."""
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     result = supabase.table("daily_health_metrics") \
         .select("date, peso_kg") \
@@ -93,7 +94,6 @@ def get_weight_trend(days: int = 90) -> list:
 
 
 def get_summary_stats() -> dict:
-    """Calcola statistiche aggregate degli ultimi 30 giorni."""
     metrics = get_recent_metrics(days=30)
     if not metrics:
         return {}
@@ -119,13 +119,11 @@ def get_summary_stats() -> dict:
 
 
 def build_context_for_claude(user_message: str) -> str:
-    """Costruisce il contesto dati da passare a Claude."""
     metrics_recenti = get_recent_metrics(days=14)
     workouts_recenti = get_recent_workouts(days=30)
     peso_trend = get_weight_trend(days=90)
     stats = get_summary_stats()
 
-    # Formatta i dati più recenti (ultimi 7 giorni)
     ultimi_7 = metrics_recenti[:7]
     righe_metriche = []
     for m in ultimi_7:
@@ -135,7 +133,6 @@ def build_context_for_claude(user_message: str) -> str:
                f"esercizio={m.get('tempo_esercizio_min','?')}min"
         righe_metriche.append(riga)
 
-    # Trend peso
     pesi = [(x['date'], x['peso_kg']) for x in peso_trend if x.get('peso_kg')]
     peso_info = ""
     if len(pesi) >= 2:
@@ -145,7 +142,6 @@ def build_context_for_claude(user_message: str) -> str:
         segno = "+" if delta > 0 else ""
         peso_info = f"Peso: {peso_recente}kg ({segno}{delta}kg negli ultimi {len(pesi)} giorni con misurazioni)"
 
-    # Allenamenti recenti
     workout_info = f"{len(workouts_recenti)} sessioni negli ultimi 30 giorni"
     if workouts_recenti:
         ultimo = workouts_recenti[0]
@@ -178,69 +174,119 @@ def build_context_for_claude(user_message: str) -> str:
 
 
 # ─────────────────────────────────────────────
+# Funzioni tracciamento token
+# ─────────────────────────────────────────────
+
+def calcola_costo(input_tokens: int, output_tokens: int) -> float:
+    """Calcola il costo in USD basato sui token usati."""
+    costo_input  = (input_tokens  / 1_000_000) * PRICE_INPUT_PER_M
+    costo_output = (output_tokens / 1_000_000) * PRICE_OUTPUT_PER_M
+    return round(costo_input + costo_output, 6)
+
+
+def salva_token_usage(input_tokens: int, output_tokens: int, messaggio: str):
+    """Salva il consumo token su Supabase."""
+    costo = calcola_costo(input_tokens, output_tokens)
+    try:
+        supabase.table("token_usage").insert({
+            "input_tokens":  input_tokens,
+            "output_tokens": output_tokens,
+            "costo_usd":     costo,
+            "messaggio":     messaggio[:100]  # primi 100 char del messaggio
+        }).execute()
+    except Exception as e:
+        logger.error(f"Errore salvataggio token: {e}")
+
+
+def get_stats_token(giorni: int = 30) -> dict:
+    """Legge le statistiche token degli ultimi N giorni."""
+    since = (datetime.now() - timedelta(days=giorni)).isoformat()
+    try:
+        result = supabase.table("token_usage") \
+            .select("*") \
+            .gte("timestamp", since) \
+            .execute()
+        rows = result.data or []
+
+        if not rows:
+            return {}
+
+        tot_input    = sum(r["input_tokens"]  for r in rows)
+        tot_output   = sum(r["output_tokens"] for r in rows)
+        tot_costo    = sum(r["costo_usd"]     for r in rows)
+        n_messaggi   = len(rows)
+
+        # Stats del mese corrente
+        inizio_mese = datetime.now().replace(day=1, hour=0, minute=0, second=0).isoformat()
+        rows_mese = [r for r in rows if r["timestamp"] >= inizio_mese]
+        costo_mese = sum(r["costo_usd"] for r in rows_mese)
+
+        return {
+            "giorni":         giorni,
+            "n_messaggi":     n_messaggi,
+            "tot_input":      tot_input,
+            "tot_output":     tot_output,
+            "tot_token":      tot_input + tot_output,
+            "tot_costo_usd":  round(tot_costo, 4),
+            "costo_mese_usd": round(costo_mese, 4),
+            "costo_medio":    round(tot_costo / n_messaggi, 4) if n_messaggi else 0,
+        }
+    except Exception as e:
+        logger.error(f"Errore lettura token: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────────
 # Gestione messaggi Telegram
 # ─────────────────────────────────────────────
 
-# Storico conversazione per sessione (in memoria)
 conversation_history: list = []
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestisce ogni messaggio ricevuto su Telegram."""
-    user_id = update.effective_user.id
 
-    # Sicurezza: accetta solo messaggi dall'utente autorizzato
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
-        await update.message.reply_text("⛔ Non sei autorizzato a usare questo bot.")
+        await update.message.reply_text("⛔ Non sei autorizzato.")
         return
 
     user_message = update.message.text
     logger.info(f"Messaggio ricevuto: {user_message[:50]}...")
 
-    # Mostra "sta scrivendo..."
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing"
     )
 
     try:
-        # Costruisci il contesto con i dati reali
         context_with_data = build_context_for_claude(user_message)
+        conversation_history.append({"role": "user", "content": context_with_data})
 
-        # Aggiungi alla conversazione
-        conversation_history.append({
-            "role": "user",
-            "content": context_with_data
-        })
-
-        # Chiama Claude
         response = anthropic.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=1000,
             system=SYSTEM_PROMPT,
-            messages=conversation_history[-10:]  # ultime 10 messaggi per contesto
+            messages=conversation_history[-10:]
         )
 
         reply = response.content[0].text
 
-        # Salva risposta nella storia
-        conversation_history.append({
-            "role": "assistant",
-            "content": reply
-        })
+        # Salva token usage
+        salva_token_usage(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            messaggio=user_message
+        )
+        logger.info(f"Token usati — input: {response.usage.input_tokens}, output: {response.usage.output_tokens}")
 
-        # Invia risposta
+        conversation_history.append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
-        logger.info("Risposta inviata con successo")
 
     except Exception as e:
         logger.error(f"Errore: {e}")
-        await update.message.reply_text(
-            "⚠️ Si è verificato un errore. Riprova tra qualche secondo."
-        )
+        await update.message.reply_text("⚠️ Si è verificato un errore. Riprova tra qualche secondo.")
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Risponde al comando /start."""
     conversation_history.clear()
     await update.message.reply_text(
         "👋 Ciao! Sono il tuo *Coach Pro Fitness*.\n\n"
@@ -251,29 +297,66 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Suggeriscimi un allenamento\n"
         "• Come è il mio trend peso?\n"
         "• Qual è il mio VO2 Max?\n\n"
+        "Comandi disponibili:\n"
+        "/start — ricomincia\n"
+        "/reset — resetta la conversazione\n"
+        "/costi — mostra i costi token\n\n"
         "Iniziamo! 💪",
         parse_mode="Markdown"
     )
 
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resetta la conversazione."""
     conversation_history.clear()
-    await update.message.reply_text("🔄 Conversazione resettata. Possiamo ricominciare!")
+    await update.message.reply_text("🔄 Conversazione resettata!")
+
+
+async def handle_costi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra le statistiche di utilizzo token e costi."""
+    user_id = update.effective_user.id
+    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+        await update.message.reply_text("⛔ Non sei autorizzato.")
+        return
+
+    stats_30  = get_stats_token(giorni=30)
+    stats_7   = get_stats_token(giorni=7)
+
+    if not stats_30:
+        await update.message.reply_text("📊 Nessun dato di utilizzo disponibile ancora.")
+        return
+
+    msg = (
+        "📊 *RIEPILOGO COSTI TOKEN*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Ultimi 7 giorni:*\n"
+        f"  💬 Messaggi: {stats_7.get('n_messaggi', 0)}\n"
+        f"  🔢 Token totali: {stats_7.get('tot_token', 0):,}\n"
+        f"  💰 Costo: ${stats_7.get('tot_costo_usd', 0):.4f}\n\n"
+        f"*Ultimi 30 giorni:*\n"
+        f"  💬 Messaggi: {stats_30.get('n_messaggi', 0)}\n"
+        f"  🔢 Token totali: {stats_30.get('tot_token', 0):,}\n"
+        f"  📥 Input token: {stats_30.get('tot_input', 0):,}\n"
+        f"  📤 Output token: {stats_30.get('tot_output', 0):,}\n"
+        f"  💰 Costo totale: ${stats_30.get('tot_costo_usd', 0):.4f}\n"
+        f"  📅 Costo mese corrente: ${stats_30.get('costo_mese_usd', 0):.4f}\n"
+        f"  📈 Costo medio/msg: ${stats_30.get('costo_medio', 0):.4f}\n\n"
+        f"_Prezzi: $3/M token input · $15/M token output_"
+    )
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ─────────────────────────────────────────────
-# Avvio del bot
+# Avvio
 # ─────────────────────────────────────────────
 
 def main():
     logger.info("🚀 Avvio Fitness Coach Agent...")
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Registra handlers
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CommandHandler("reset", handle_reset))
+    app.add_handler(CommandHandler("start",  handle_start))
+    app.add_handler(CommandHandler("reset",  handle_reset))
+    app.add_handler(CommandHandler("costi",  handle_costi))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("✅ Bot in ascolto su Telegram...")

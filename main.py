@@ -34,6 +34,69 @@ Rispondi sempre in italiano."""
 
 conversation_history: list = []
 peso_state: dict = {}
+n_messaggi_sessione: int = 0  # MEMORIA: conta messaggi sessione
+
+# ─────────────────────────────────────────────
+# MEMORIA: funzioni
+# ─────────────────────────────────────────────
+
+def carica_memoria() -> str:
+    """Carica l'ultimo riassunto dalla tabella memoria."""
+    try:
+        res = supabase.table("memoria") \
+            .select("riassunto") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if res.data:
+            return res.data[0]["riassunto"]
+    except Exception as e:
+        logger.error(f"Errore caricamento memoria: {e}")
+    return ""
+
+
+def salva_memoria(riassunto: str, n_msg: int):
+    """Salva un nuovo riassunto su Supabase."""
+    try:
+        supabase.table("memoria").insert({
+            "riassunto":  riassunto,
+            "n_messaggi": n_msg
+        }).execute()
+        logger.info(f"Memoria salvata ({n_msg} messaggi riassunti)")
+    except Exception as e:
+        logger.error(f"Errore salvataggio memoria: {e}")
+
+
+def genera_riassunto(storia: list) -> str:
+    """Chiede a Claude di riassumere la conversazione in max 250 parole."""
+    if not storia:
+        return ""
+    try:
+        testo_conv = "\n".join([
+            f"{'Simone' if m['role']=='user' else 'Coach'}: {m['content'][:300]}"
+            for m in storia
+        ])
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=400,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Riassumi questa conversazione tra Simone e il suo coach fitness "
+                    f"in massimo 250 parole. Includi: obiettivi discussi, progressi, "
+                    f"problemi menzionati, consigli dati, preferenze emerse. "
+                    f"Scrivi in italiano, in forma compatta.\n\n{testo_conv}"
+                )
+            }]
+        )
+        return response.content[0].text
+    except Exception as e:
+        logger.error(f"Errore generazione riassunto: {e}")
+        return ""
+
+# ─────────────────────────────────────────────
+# Funzioni Supabase — dati fitness
+# ─────────────────────────────────────────────
 
 def get_recent_metrics(days=14):
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -70,7 +133,7 @@ def get_summary_stats():
         "eta_metabolica":        next((x["eta_metabolica"] for x in metrics if x.get("eta_metabolica")), None),
     }
 
-def build_context_for_claude(user_message):
+def build_context_for_claude(user_message, memoria=""):
     metrics_recenti = get_recent_metrics(days=14)
     workouts_recenti = get_recent_workouts(days=30)
     peso_trend = get_weight_trend(days=90)
@@ -88,8 +151,12 @@ def build_context_for_claude(user_message):
     if workouts_recenti:
         u = workouts_recenti[0]
         workout_info += f" | Ultimo: {u['data_ora'][:10]}, FC media {u.get('fc_media','?')}bpm"
+
+    # MEMORIA: aggiunge il riassunto al contesto se disponibile
+    sezione_memoria = f"\n=== MEMORIA CONVERSAZIONI PRECEDENTI ===\n{memoria}\n" if memoria else ""
+
     return f"""
-=== DATI REALI UTENTE ===
+=== DATI REALI UTENTE ==={sezione_memoria}
 STATISTICHE 30 GIORNI:
 - Passi medi: {stats.get('passi_medi','N/D')}
 - FC riposo: {stats.get('fc_riposo_media','N/D')} bpm
@@ -173,6 +240,7 @@ async def handle_peso_input(update, context, text):
             await update.message.reply_text("Errore nel salvataggio. Riprova con /peso.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global n_messaggi_sessione
     user_id = update.effective_user.id
     if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
         await update.message.reply_text("Non sei autorizzato.")
@@ -183,24 +251,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
-        ctx = build_context_for_claude(user_message)
+        # MEMORIA: carica riassunto precedente
+        memoria = carica_memoria()
+        ctx = build_context_for_claude(user_message, memoria)
         conversation_history.append({"role":"user","content":ctx})
-        response = anthropic.messages.create(model="claude-sonnet-4-5", max_tokens=1000, system=SYSTEM_PROMPT, messages=conversation_history[-10:])
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=conversation_history[-10:]
+        )
         reply = response.content[0].text
         salva_token_usage(response.usage.input_tokens, response.usage.output_tokens, user_message)
         conversation_history.append({"role":"assistant","content":reply})
+        n_messaggi_sessione += 1
         await update.message.reply_text(reply)
+
+        # MEMORIA: ogni 5 messaggi genera e salva il riassunto
+        if n_messaggi_sessione % 5 == 0:
+            logger.info("Generazione riassunto memoria...")
+            riassunto = genera_riassunto(conversation_history[-10:])
+            if riassunto:
+                salva_memoria(riassunto, n_messaggi_sessione)
+
     except Exception as e:
         logger.error(f"Errore: {e}")
         await update.message.reply_text("Si e verificato un errore. Riprova.")
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global n_messaggi_sessione
     conversation_history.clear()
-    await update.message.reply_text("Ciao! Sono il tuo Coach Pro Fitness.\n\nComandi:\n/start - ricomincia\n/reset - resetta conversazione\n/costi - costi token\n/peso - inserisci metriche Renpho\n\nIniziamoù")
+    n_messaggi_sessione = 0
+    # MEMORIA: carica riassunto all'avvio
+    memoria = carica_memoria()
+    benvenuto = "Ciao! Sono il tuo Coach Pro Fitness.\n\nComandi:\n/start - ricomincia\n/reset - resetta conversazione\n/costi - costi token\n/peso - inserisci metriche Renpho\n/memoria - vedi ultimo riassunto\n\nIniziamo!"
+    if memoria:
+        benvenuto += f"\n\nRicordo dalla nostra ultima sessione:\n{memoria[:200]}..."
+    await update.message.reply_text(benvenuto)
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global n_messaggi_sessione
+    # MEMORIA: salva prima di resettare
+    if conversation_history:
+        riassunto = genera_riassunto(conversation_history)
+        if riassunto:
+            salva_memoria(riassunto, n_messaggi_sessione)
     conversation_history.clear()
-    await update.message.reply_text("Conversazione resettata!")
+    n_messaggi_sessione = 0
+    await update.message.reply_text("Conversazione resettata! Ho salvato un riassunto della sessione.")
 
 async def handle_costi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s30 = get_stats_token(30)
@@ -215,6 +313,14 @@ async def handle_costi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Mese corrente: ${s30.get('costo_mese_usd',0):.4f}\n"
         f"Media/msg: ${s30.get('costo_medio',0):.4f}"
     )
+
+async def handle_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MEMORIA: mostra l'ultimo riassunto salvato."""
+    memoria = carica_memoria()
+    if memoria:
+        await update.message.reply_text(f"Ultimo riassunto salvato:\n\n{memoria}")
+    else:
+        await update.message.reply_text("Nessun riassunto disponibile ancora. Chatta un po' con il coach!")
 
 async def handle_peso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -237,10 +343,11 @@ async def handle_peso(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("Avvio Fitness Coach Agent...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CommandHandler("reset", handle_reset))
-    app.add_handler(CommandHandler("costi", handle_costi))
-    app.add_handler(CommandHandler("peso",  handle_peso))
+    app.add_handler(CommandHandler("start",   handle_start))
+    app.add_handler(CommandHandler("reset",   handle_reset))
+    app.add_handler(CommandHandler("costi",   handle_costi))
+    app.add_handler(CommandHandler("peso",    handle_peso))
+    app.add_handler(CommandHandler("memoria", handle_memoria))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot in ascolto...")
     app.run_polling(drop_pending_updates=True)

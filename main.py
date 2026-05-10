@@ -3,6 +3,7 @@ Fitness Coach Agent
 """
 
 import os
+import json
 import logging
 from datetime import datetime, timedelta
 from supabase import create_client
@@ -34,68 +35,11 @@ Rispondi sempre in italiano."""
 
 conversation_history: list = []
 peso_state: dict = {}
-n_messaggi_sessione: int = 0  # MEMORIA: conta messaggi sessione
+basket_state: dict = {}
+n_messaggi_sessione: int = 0
 
 # ─────────────────────────────────────────────
-# MEMORIA: funzioni
-# ─────────────────────────────────────────────
-
-def carica_memoria() -> str:
-    """Carica l'ultimo riassunto dalla tabella memoria."""
-    try:
-        res = supabase.table("memoria") \
-            .select("riassunto") \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-        if res.data:
-            return res.data[0]["riassunto"]
-    except Exception as e:
-        logger.error(f"Errore caricamento memoria: {e}")
-    return ""
-
-
-def salva_memoria(riassunto: str, n_msg: int):
-    """Salva un nuovo riassunto su Supabase."""
-    try:
-        supabase.table("memoria").insert({
-            "riassunto":  riassunto,
-            "n_messaggi": n_msg
-        }).execute()
-        logger.info(f"Memoria salvata ({n_msg} messaggi riassunti)")
-    except Exception as e:
-        logger.error(f"Errore salvataggio memoria: {e}")
-
-
-def genera_riassunto(storia: list) -> str:
-    """Chiede a Claude di riassumere la conversazione in max 250 parole."""
-    if not storia:
-        return ""
-    try:
-        testo_conv = "\n".join([
-            f"{'Simone' if m['role']=='user' else 'Coach'}: {m['content'][:300]}"
-            for m in storia
-        ])
-        response = anthropic.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=400,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Riassumi questa conversazione tra Simone e il suo coach fitness "
-                    f"in massimo 250 parole. Includi: obiettivi discussi, progressi, "
-                    f"problemi menzionati, consigli dati, preferenze emerse. "
-                    f"Scrivi in italiano, in forma compatta.\n\n{testo_conv}"
-                )
-            }]
-        )
-        return response.content[0].text
-    except Exception as e:
-        logger.error(f"Errore generazione riassunto: {e}")
-        return ""
-
-# ─────────────────────────────────────────────
-# Funzioni Supabase — dati fitness
+# Funzioni Supabase
 # ─────────────────────────────────────────────
 
 def get_recent_metrics(days=14):
@@ -105,6 +49,10 @@ def get_recent_metrics(days=14):
 def get_recent_workouts(days=30):
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     return supabase.table("workouts").select("*").gte("data_ora", since).order("data_ora", desc=True).execute().data or []
+
+def get_recent_basket(days=30):
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    return supabase.table("basket_sessions").select("*").gte("data_ora", since).order("data_ora", desc=True).execute().data or []
 
 def get_weight_trend(days=90):
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -136,6 +84,7 @@ def get_summary_stats():
 def build_context_for_claude(user_message, memoria=""):
     metrics_recenti = get_recent_metrics(days=14)
     workouts_recenti = get_recent_workouts(days=30)
+    basket_recenti = get_recent_basket(days=30)
     peso_trend = get_weight_trend(days=90)
     stats = get_summary_stats()
     ultimi_7 = metrics_recenti[:7]
@@ -151,10 +100,11 @@ def build_context_for_claude(user_message, memoria=""):
     if workouts_recenti:
         u = workouts_recenti[0]
         workout_info += f" | Ultimo: {u['data_ora'][:10]}, FC media {u.get('fc_media','?')}bpm"
-
-    # MEMORIA: aggiunge il riassunto al contesto se disponibile
+    basket_info = f"{len(basket_recenti)} sessioni basket negli ultimi 30 giorni"
+    if basket_recenti:
+        b = basket_recenti[0]
+        basket_info += f" | Ultima: {b['data_ora'][:10]}, {b.get('tipo','?')}, intensita {b.get('intensita','?')}/10"
     sezione_memoria = f"\n=== MEMORIA CONVERSAZIONI PRECEDENTI ===\n{memoria}\n" if memoria else ""
-
     return f"""
 === DATI REALI UTENTE ==={sezione_memoria}
 STATISTICHE 30 GIORNI:
@@ -164,7 +114,8 @@ STATISTICHE 30 GIORNI:
 - VO2Max: {stats.get('vo2max_recente','N/D')} ml/kg/min
 - HRV: {stats.get('variabilita_fc_media','N/D')} ms
 - Esercizio medio: {stats.get('tempo_esercizio_medio','N/D')} min/gg
-- Allenamenti: {workout_info}
+- Allenamenti palestra: {workout_info}
+- Basket: {basket_info}
 - Grasso corporeo: {stats.get('grasso_corporeo','N/D')}%
 - Massa muscolare: {stats.get('massa_muscolare','N/D')} kg
 - Grasso viscerale: {stats.get('grasso_viscerale','N/D')}
@@ -174,6 +125,44 @@ ULTIMI 7 GIORNI:
 {chr(10).join(righe) if righe else 'Nessun dato'}
 === MESSAGGIO ===
 {user_message}"""
+
+# ─────────────────────────────────────────────
+# Memoria
+# ─────────────────────────────────────────────
+
+def carica_memoria():
+    try:
+        res = supabase.table("memoria").select("riassunto").order("created_at", desc=True).limit(1).execute()
+        if res.data:
+            return res.data[0]["riassunto"]
+    except Exception as e:
+        logger.error(f"Errore caricamento memoria: {e}")
+    return ""
+
+def salva_memoria(riassunto, n_msg):
+    try:
+        supabase.table("memoria").insert({"riassunto": riassunto, "n_messaggi": n_msg}).execute()
+    except Exception as e:
+        logger.error(f"Errore salvataggio memoria: {e}")
+
+def genera_riassunto(storia):
+    if not storia:
+        return ""
+    try:
+        testo = "\n".join([f"{'Simone' if m['role']=='user' else 'Coach'}: {m['content'][:300]}" for m in storia])
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=400,
+            messages=[{"role":"user","content":f"Riassumi questa conversazione tra Simone e il suo coach fitness in massimo 250 parole. Includi: obiettivi discussi, progressi, problemi, consigli, preferenze. In italiano, forma compatta.\n\n{testo}"}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        logger.error(f"Errore riassunto: {e}")
+        return ""
+
+# ─────────────────────────────────────────────
+# Token
+# ─────────────────────────────────────────────
 
 def calcola_costo(i, o):
     return round((i/1_000_000)*PRICE_INPUT_PER_M + (o/1_000_000)*PRICE_OUTPUT_PER_M, 6)
@@ -198,6 +187,211 @@ def get_stats_token(giorni=30):
     except Exception as e:
         logger.error(f"Errore stats token: {e}")
         return {}
+
+# ─────────────────────────────────────────────
+# Stima metriche basket con Claude
+# ─────────────────────────────────────────────
+
+def stima_metriche_basket(session_data: dict, peso_kg: float) -> dict:
+    """Chiede a Claude di stimare le metriche fisiologiche della sessione basket."""
+    try:
+        prompt = f"""Sei un esperto di fisiologia dello sport. Stima le metriche fisiologiche per questa sessione di basket.
+
+Dati utente:
+- Peso: {peso_kg} kg
+- Tipo sessione: {session_data.get('tipo')}
+- {'Minuti giocati: ' + str(session_data.get('minuti_giocati')) if session_data.get('tipo') == 'partita' else 'Durata: ' + str(session_data.get('durata_min')) + ' min'}
+- {'Risultato: ' + str(session_data.get('risultato')) if session_data.get('tipo') == 'partita' else 'Focus: ' + str(session_data.get('focus'))}
+- Intensita percepita: {session_data.get('intensita')}/10
+- Note: {session_data.get('note', 'nessuna')}
+
+Rispondi SOLO con un JSON valido con questi campi:
+{{
+  "calorie_stimate": <int>,
+  "fc_media_stimata": <int>,
+  "fc_max_stimata": <int>,
+  "distanza_stimata_km": <float>,
+  "carico_allenamento": <int>,
+  "spiegazione": "<stringa breve max 100 parole>"
+}}
+
+Per il basket:
+- Una partita a intensita 7-8/10 brucia circa 600-800 kcal/ora
+- FC media in partita e circa 155-175 bpm
+- Distanza percorsa in partita e circa 5-7 km
+- Allenamento tecnico brucia meno (400-500 kcal/ora)
+- Carico allenamento = minuti x intensita"""
+
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=300,
+            messages=[{"role":"user","content":prompt}]
+        )
+        text = response.content[0].text.strip()
+        # Estrai JSON dalla risposta
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        return json.loads(text[start:end])
+    except Exception as e:
+        logger.error(f"Errore stima metriche basket: {e}")
+        return {}
+
+# ─────────────────────────────────────────────
+# Gestione stato basket
+# ─────────────────────────────────────────────
+
+async def handle_basket_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    user_id = update.effective_user.id
+    state = basket_state[user_id]
+    step = state["step"]
+
+    if text.lower() in ("annulla", "cancel"):
+        del basket_state[user_id]
+        await update.message.reply_text("Inserimento annullato.")
+        return
+
+    # Step 0: tipo sessione
+    if step == "tipo":
+        if text.lower() in ("1", "partita"):
+            state["data"]["tipo"] = "partita"
+            state["step"] = "minuti"
+            await update.message.reply_text("Quanti minuti hai giocato?")
+        elif text.lower() in ("2", "allenamento"):
+            state["data"]["tipo"] = "allenamento"
+            state["step"] = "durata"
+            await update.message.reply_text("Durata allenamento in minuti?")
+        else:
+            await update.message.reply_text("Scrivi 1 per Partita o 2 per Allenamento:")
+        return
+
+    # Step partita
+    if step == "minuti":
+        try:
+            state["data"]["minuti_giocati"] = int(text.strip())
+            state["step"] = "risultato"
+            await update.message.reply_text("Risultato?\n1 - Vinto\n2 - Perso")
+        except ValueError:
+            await update.message.reply_text("Inserisci un numero di minuti valido:")
+        return
+
+    if step == "risultato":
+        if text.lower() in ("1", "vinto"):
+            state["data"]["risultato"] = "vinto"
+        elif text.lower() in ("2", "perso"):
+            state["data"]["risultato"] = "perso"
+        else:
+            await update.message.reply_text("Scrivi 1 per Vinto o 2 per Perso:")
+            return
+        state["step"] = "intensita"
+        await update.message.reply_text("Intensita percepita? (1-10)\n1=molto bassa, 10=massima")
+        return
+
+    # Step allenamento
+    if step == "durata":
+        try:
+            state["data"]["durata_min"] = int(text.strip())
+            state["step"] = "focus"
+            await update.message.reply_text(
+                "Focus dell'allenamento?\n"
+                "1 - Tiro\n2 - Palleggio\n3 - Difesa\n4 - Fisico\n5 - Misto"
+            )
+        except ValueError:
+            await update.message.reply_text("Inserisci un numero di minuti valido:")
+        return
+
+    if step == "focus":
+        focus_map = {"1":"tiro","2":"palleggio","3":"difesa","4":"fisico","5":"misto"}
+        focus = focus_map.get(text.strip(), text.lower())
+        state["data"]["focus"] = focus
+        state["step"] = "intensita"
+        await update.message.reply_text("Intensita percepita? (1-10)\n1=molto bassa, 10=massima")
+        return
+
+    # Step comune: intensita
+    if step == "intensita":
+        try:
+            val = int(text.strip())
+            if not 1 <= val <= 10:
+                raise ValueError
+            state["data"]["intensita"] = val
+            state["step"] = "note"
+            await update.message.reply_text("Note aggiuntive? (opzionale, scrivi - per saltare)")
+        except ValueError:
+            await update.message.reply_text("Inserisci un numero tra 1 e 10:")
+        return
+
+    # Step finale: note
+    if step == "note":
+        state["data"]["note"] = None if text.strip() == "-" else text.strip()
+
+        await update.message.reply_text("Elaboro le metriche con AI...")
+
+        # Recupera peso attuale
+        peso_recente = get_recent_metrics(days=30)
+        peso_kg = next((x["peso_kg"] for x in peso_recente if x.get("peso_kg")), 75.0)
+
+        # Stima metriche con Claude
+        metriche = stima_metriche_basket(state["data"], peso_kg)
+
+        # Prepara record da salvare
+        record = {
+            "data_ora": datetime.now().isoformat(),
+            "tipo": state["data"].get("tipo"),
+            "minuti_giocati": state["data"].get("minuti_giocati"),
+            "risultato": state["data"].get("risultato"),
+            "durata_min": state["data"].get("durata_min"),
+            "focus": state["data"].get("focus"),
+            "intensita": state["data"].get("intensita"),
+            "note": state["data"].get("note"),
+            "calorie_stimate": metriche.get("calorie_stimate"),
+            "fc_media_stimata": metriche.get("fc_media_stimata"),
+            "fc_max_stimata": metriche.get("fc_max_stimata"),
+            "distanza_stimata_km": metriche.get("distanza_stimata_km"),
+            "carico_allenamento": metriche.get("carico_allenamento"),
+        }
+
+        try:
+            supabase.table("basket_sessions").insert(record).execute()
+            del basket_state[user_id]
+
+            tipo = state["data"].get("tipo", "")
+            if tipo == "partita":
+                riepilogo = (
+                    f"Partita salvata!\n\n"
+                    f"Minuti giocati: {state['data'].get('minuti_giocati')}\n"
+                    f"Risultato: {state['data'].get('risultato')}\n"
+                    f"Intensita: {state['data'].get('intensita')}/10\n\n"
+                    f"Stime AI:\n"
+                    f"  Calorie: ~{metriche.get('calorie_stimate', 'N/D')} kcal\n"
+                    f"  FC media: ~{metriche.get('fc_media_stimata', 'N/D')} bpm\n"
+                    f"  FC max: ~{metriche.get('fc_max_stimata', 'N/D')} bpm\n"
+                    f"  Distanza: ~{metriche.get('distanza_stimata_km', 'N/D')} km\n"
+                    f"  Carico: {metriche.get('carico_allenamento', 'N/D')}\n\n"
+                    f"Note coach: {metriche.get('spiegazione', '')}"
+                )
+            else:
+                riepilogo = (
+                    f"Allenamento basket salvato!\n\n"
+                    f"Durata: {state['data'].get('durata_min')} min\n"
+                    f"Focus: {state['data'].get('focus')}\n"
+                    f"Intensita: {state['data'].get('intensita')}/10\n\n"
+                    f"Stime AI:\n"
+                    f"  Calorie: ~{metriche.get('calorie_stimate', 'N/D')} kcal\n"
+                    f"  FC media: ~{metriche.get('fc_media_stimata', 'N/D')} bpm\n"
+                    f"  FC max: ~{metriche.get('fc_max_stimata', 'N/D')} bpm\n"
+                    f"  Carico: {metriche.get('carico_allenamento', 'N/D')}\n\n"
+                    f"Note coach: {metriche.get('spiegazione', '')}"
+                )
+            await update.message.reply_text(riepilogo)
+
+        except Exception as e:
+            del basket_state[user_id]
+            logger.error(f"Errore salvataggio basket: {e}")
+            await update.message.reply_text("Errore nel salvataggio. Riprova con /basket.")
+
+# ─────────────────────────────────────────────
+# Gestione peso
+# ─────────────────────────────────────────────
 
 async def handle_peso_input(update, context, text):
     user_id = update.effective_user.id
@@ -236,8 +430,12 @@ async def handle_peso_input(update, context, text):
             await update.message.reply_text(f"Dati salvati per {oggi}:\n{righe}")
         except Exception as e:
             del peso_state[user_id]
-            logger.error(f"Errore salvataggio: {e}")
+            logger.error(f"Errore salvataggio peso: {e}")
             await update.message.reply_text("Errore nel salvataggio. Riprova con /peso.")
+
+# ─────────────────────────────────────────────
+# Handlers Telegram
+# ─────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global n_messaggi_sessione
@@ -249,9 +447,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in peso_state:
         await handle_peso_input(update, context, user_message)
         return
+    if user_id in basket_state:
+        await handle_basket_input(update, context, user_message)
+        return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
-        # MEMORIA: carica riassunto precedente
         memoria = carica_memoria()
         ctx = build_context_for_claude(user_message, memoria)
         conversation_history.append({"role":"user","content":ctx})
@@ -266,14 +466,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conversation_history.append({"role":"assistant","content":reply})
         n_messaggi_sessione += 1
         await update.message.reply_text(reply)
-
-        # MEMORIA: ogni 5 messaggi genera e salva il riassunto
         if n_messaggi_sessione % 5 == 0:
-            logger.info("Generazione riassunto memoria...")
             riassunto = genera_riassunto(conversation_history[-10:])
             if riassunto:
                 salva_memoria(riassunto, n_messaggi_sessione)
-
     except Exception as e:
         logger.error(f"Errore: {e}")
         await update.message.reply_text("Si e verificato un errore. Riprova.")
@@ -282,16 +478,24 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global n_messaggi_sessione
     conversation_history.clear()
     n_messaggi_sessione = 0
-    # MEMORIA: carica riassunto all'avvio
     memoria = carica_memoria()
-    benvenuto = "Ciao! Sono il tuo Coach Pro Fitness.\n\nComandi:\n/start - ricomincia\n/reset - resetta conversazione\n/costi - costi token\n/peso - inserisci metriche Renpho\n/memoria - vedi ultimo riassunto\n\nIniziamo!"
+    benvenuto = (
+        "Ciao! Sono il tuo Coach Pro Fitness.\n\n"
+        "Comandi:\n"
+        "/start - ricomincia\n"
+        "/reset - resetta conversazione\n"
+        "/costi - costi token\n"
+        "/peso - inserisci metriche Renpho\n"
+        "/memoria - vedi ultimo riassunto\n"
+        "/basket - registra sessione basket\n\n"
+        "Iniziamo!"
+    )
     if memoria:
         benvenuto += f"\n\nRicordo dalla nostra ultima sessione:\n{memoria[:200]}..."
     await update.message.reply_text(benvenuto)
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global n_messaggi_sessione
-    # MEMORIA: salva prima di resettare
     if conversation_history:
         riassunto = genera_riassunto(conversation_history)
         if riassunto:
@@ -315,12 +519,11 @@ async def handle_costi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """MEMORIA: mostra l'ultimo riassunto salvato."""
     memoria = carica_memoria()
     if memoria:
-        await update.message.reply_text(f"Ultimo riassunto salvato:\n\n{memoria}")
+        await update.message.reply_text(f"Ultimo riassunto:\n\n{memoria}")
     else:
-        await update.message.reply_text("Nessun riassunto disponibile ancora. Chatta un po' con il coach!")
+        await update.message.reply_text("Nessun riassunto disponibile ancora.")
 
 async def handle_peso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -340,6 +543,24 @@ async def handle_peso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     peso_state[user_id] = {"campi":campi,"idx":0,"valori":{nome:None for nome,_,_ in campi}}
     await update.message.reply_text("Inserimento metriche Renpho\nScrivi - per saltare, annulla per uscire.\n\nGrasso viscerale (1-20):")
 
+async def handle_basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+        await update.message.reply_text("Non sei autorizzato.")
+        return
+    basket_state[user_id] = {"step": "tipo", "data": {}}
+    await update.message.reply_text(
+        "Registrazione sessione basket\n"
+        "Scrivi annulla per uscire.\n\n"
+        "Tipo di sessione?\n"
+        "1 - Partita\n"
+        "2 - Allenamento"
+    )
+
+# ─────────────────────────────────────────────
+# Avvio
+# ─────────────────────────────────────────────
+
 def main():
     logger.info("Avvio Fitness Coach Agent...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -348,6 +569,7 @@ def main():
     app.add_handler(CommandHandler("costi",   handle_costi))
     app.add_handler(CommandHandler("peso",    handle_peso))
     app.add_handler(CommandHandler("memoria", handle_memoria))
+    app.add_handler(CommandHandler("basket",  handle_basket))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot in ascolto...")
     app.run_polling(drop_pending_updates=True)
